@@ -184,6 +184,7 @@ class Unet(object):
         
         self.x = tf.placeholder("float", shape=[None, None, None, channels])
         self.y = tf.placeholder("float", shape=[None, None, None, n_class])
+        self.w = tf.placeholder("float", shape=[None, None, None, channels])
         self.keep_prob = tf.placeholder(tf.float32) #dropout (keep probability)
         
         logits, self.variables, self.offset = create_conv_net(self.x, self.keep_prob, channels, n_class, **kwargs)
@@ -222,11 +223,19 @@ class Unet(object):
                                                                    labels=flat_labels)
                 weighted_loss = tf.multiply(loss_map, weight_map)
         
-                loss = tf.reduce_mean(weighted_loss)
+                #weight each pixel by value specified in weight map (added 1/10/2018)
+                loss = tf.reduce_mean(tf.multiply(weighted_loss,tf.reshape(self.w,[-1])))
                 
             else:
-                loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=flat_logits, 
-                                                                              labels=flat_labels))
+                #weight each pixel by value specified in weight map (added 1/10/2018)
+                weight_map = tf.reshape(self.w,[-1])
+                
+                loss_map = tf.nn.softmax_cross_entropy_with_logits(logits=flat_logits, 
+                                                                   labels=flat_labels)
+                weighted_loss = tf.multiply(loss_map,weight_map)
+
+                loss = tf.reduce_mean(weighted_loss)
+                
         elif cost_name == "dice_coefficient":
             eps = 1e-5
             prediction = pixel_wise_softmax_2(logits)
@@ -262,7 +271,8 @@ class Unet(object):
             self.restore(sess, model_path)
             
             y_dummy = np.empty((x_test.shape[0], x_test.shape[1], x_test.shape[2], self.n_class))
-            prediction = sess.run(self.predicter, feed_dict={self.x: x_test, self.y: y_dummy, self.keep_prob: 1.})
+            w_dummy = np.empty((x_test.shape[0], x_test.shape[1], x_test.shape[2], self.n_class))
+            prediction = sess.run(self.predicter, feed_dict={self.x: x_test, self.y: y_dummy, self.w: w_dummy, self.keep_prob: 1.})
             
         return prediction
     
@@ -405,8 +415,8 @@ class Trainer(object):
                 if ckpt and ckpt.model_checkpoint_path:
                     self.net.restore(sess, ckpt.model_checkpoint_path)
             
-            test_x, test_y = data_provider(self.verification_batch_size)
-            pred_shape = self.store_prediction(sess, test_x, test_y, "_init")
+            test_x, test_y, test_w = data_provider(self.verification_batch_size)
+            pred_shape = self.store_prediction(sess, test_x, test_y, test_w, "_init")
             
             summary_writer = tf.summary.FileWriter(output_path, graph=sess.graph)
             logging.info("Start optimization")
@@ -415,12 +425,13 @@ class Trainer(object):
             for epoch in range(epochs):
                 total_loss = 0
                 for step in range((epoch*training_iters), ((epoch+1)*training_iters)):
-                    batch_x, batch_y = data_provider(self.batch_size)
+                    batch_x, batch_y, batch_w = data_provider(self.batch_size)
                      
                     # Run optimization op (backprop)
                     _, loss, lr, gradients = sess.run((self.optimizer, self.net.cost, self.learning_rate_node, self.net.gradients_node), 
                                                       feed_dict={self.net.x: batch_x,
                                                                  self.net.y: util.crop_to_shape(batch_y, pred_shape),
+                                                                 self.net.w: util.crop_to_shape(batch_w, pred_shape),
                                                                  self.net.keep_prob: dropout})
 
                     if self.net.summaries and self.norm_grads:
@@ -429,26 +440,28 @@ class Trainer(object):
                         self.norm_gradients_node.assign(norm_gradients).eval()
                     
                     if step % display_step == 0:
-                        self.output_minibatch_stats(sess, summary_writer, step, batch_x, util.crop_to_shape(batch_y, pred_shape))
+                        self.output_minibatch_stats(sess, summary_writer, step, batch_x, util.crop_to_shape(batch_y, pred_shape),util.crop_to_shape(batch_w, pred_shape))
                         
                     total_loss += loss
 
                 self.output_epoch_stats(epoch, total_loss, training_iters, lr)
-                self.store_prediction(sess, test_x, test_y, "epoch_%s"%epoch)
+                self.store_prediction(sess, test_x, test_y, test_w, "epoch_%s"%epoch)
                     
                 save_path = self.net.save(sess, save_path)
             logging.info("Optimization Finished!")
             
             return save_path
         
-    def store_prediction(self, sess, batch_x, batch_y, name):
+    def store_prediction(self, sess, batch_x, batch_y, batch_w, name):
         prediction = sess.run(self.net.predicter, feed_dict={self.net.x: batch_x, 
                                                              self.net.y: batch_y, 
+                                                             self.net.w: batch_w,
                                                              self.net.keep_prob: 1.})
         pred_shape = prediction.shape
         
         loss = sess.run(self.net.cost, feed_dict={self.net.x: batch_x, 
-                                                       self.net.y: util.crop_to_shape(batch_y, pred_shape), 
+                                                       self.net.y: util.crop_to_shape(batch_y, pred_shape),
+                                                       self.net.w: util.crop_to_shape(batch_w, pred_shape),
                                                        self.net.keep_prob: 1.})
         
         logging.info("Verification error= {:.1f}%, loss= {:.4f}".format(error_rate(prediction,
@@ -464,7 +477,7 @@ class Trainer(object):
     def output_epoch_stats(self, epoch, total_loss, training_iters, lr):
         logging.info("Epoch {:}, Average loss: {:.4f}, learning rate: {:.4f}".format(epoch, (total_loss / training_iters), lr))
     
-    def output_minibatch_stats(self, sess, summary_writer, step, batch_x, batch_y):
+    def output_minibatch_stats(self, sess, summary_writer, step, batch_x, batch_y, batch_w):
         # Calculate batch loss and accuracy
         summary_str, loss, acc, predictions = sess.run([self.summary_op, 
                                                             self.net.cost, 
@@ -472,6 +485,7 @@ class Trainer(object):
                                                             self.net.predicter], 
                                                            feed_dict={self.net.x: batch_x,
                                                                       self.net.y: batch_y,
+                                                                      self.net.w: batch_w,
                                                                       self.net.keep_prob: 1.})
         summary_writer.add_summary(summary_str, step)
         summary_writer.flush()
