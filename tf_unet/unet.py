@@ -271,7 +271,7 @@ class Unet(object):
             self.restore(sess, model_path)
             
             y_dummy = np.empty((x_test.shape[0], x_test.shape[1], x_test.shape[2], self.n_class))
-            w_dummy = np.empty((x_test.shape[0], x_test.shape[1], x_test.shape[2], self.n_class))
+            w_dummy = np.empty((x_test.shape[0], x_test.shape[1], x_test.shape[2], x_test.shape[3]))
             prediction = sess.run(self.predicter, feed_dict={self.x: x_test, self.y: y_dummy, self.w: w_dummy, self.keep_prob: 1.})
             
         return prediction
